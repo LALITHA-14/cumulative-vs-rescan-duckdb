@@ -1,0 +1,1692 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+import duckdb
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent
+
+DATA_DIR = ROOT / "data" / "events"
+RUNTIME_DIR = ROOT / "runtime"
+RESULTS_DIR = ROOT / "results"
+
+DB_PATH = RUNTIME_DIR / "benchmark.duckdb"
+
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def sql_string(value: str) -> str:
+    """Safely quote a SQL string."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def sql_date(value: date) -> str:
+    return value.isoformat()
+
+
+def get_connection() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(str(DB_PATH))
+
+
+def ensure_directories() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# DATA DISCOVERY
+# ============================================================
+
+# Building the partition map once is important for the 365-day
+# benchmark. Without this cache, a missing date can trigger a full
+# recursive directory walk; the 365-day rescan repeats that walk for
+# every date of every benchmark day.
+_PARTITION_INDEX: dict[date, list[str]] | None = None
+
+
+def _date_from_path(path: Path) -> date | None:
+    """Extract a date from a Hive partition or a dated path component."""
+    normalized = str(path).replace("\\", "/")
+    marker = "date="
+
+    if marker in normalized:
+        candidate = normalized.split(marker, 1)[1].split("/", 1)[0]
+        try:
+            return date.fromisoformat(candidate)
+        except ValueError:
+            pass
+
+    for part in normalized.split("/"):
+        if len(part) < 10:
+            continue
+        for start in range(len(part) - 9):
+            try:
+                return date.fromisoformat(part[start:start + 10])
+            except ValueError:
+                continue
+    return None
+
+
+def _get_partition_index() -> dict[date, list[str]]:
+    """Index all Parquet files by date once per process."""
+    global _PARTITION_INDEX
+    if _PARTITION_INDEX is not None:
+        return _PARTITION_INDEX
+
+    index: dict[date, list[str]] = {}
+    if DATA_DIR.exists():
+        for path in DATA_DIR.rglob("*.parquet"):
+            if not path.is_file():
+                continue
+            partition_date = _date_from_path(path)
+            if partition_date is not None:
+                index.setdefault(partition_date, []).append(str(path))
+
+    _PARTITION_INDEX = {
+        day: sorted(set(files)) for day, files in index.items()
+    }
+    return _PARTITION_INDEX
+
+
+def discover_partition(target_date: date) -> list[str]:
+    """Return the cached Parquet file list for a date."""
+    return list(_get_partition_index().get(target_date, []))
+
+
+def available_dates() -> list[date]:
+    """Return all dates for which Parquet data exists."""
+    return sorted(_get_partition_index())
+
+
+def require_partition(target_date: date) -> list[str]:
+    files = discover_partition(target_date)
+
+    if not files:
+        raise FileNotFoundError(
+            f"No Parquet data found for {target_date} "
+            f"under {DATA_DIR}"
+        )
+
+    return files
+
+
+def parquet_relation(files: list[str]) -> str:
+    """
+    Build a DuckDB read_parquet relation.
+
+    union_by_name=True permits multiple files with the same
+    logical schema to be read together.
+    """
+
+    escaped = [
+        "'"
+        + path.replace("\\", "/").replace("'", "''")
+        + "'"
+        for path in files
+    ]
+
+    return (
+        f"read_parquet("
+        f"[{', '.join(escaped)}], "
+        f"union_by_name=true"
+        f")"
+    )
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+def initialize_database(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cumulative_state (
+            user_id VARCHAR,
+            run_date DATE,
+            activity_array INTEGER[],
+            like_array INTEGER[],
+            comment_array INTEGER[],
+            share_array INTEGER[],
+            PRIMARY KEY (user_id, run_date)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rescan_metrics (
+            user_id VARCHAR,
+            run_date DATE,
+            is_active_today INTEGER,
+            is_active_7d INTEGER,
+            is_active_30d INTEGER,
+            likes_7d INTEGER,
+            comments_7d INTEGER,
+            shares_7d INTEGER,
+            likes_30d INTEGER,
+            comments_30d INTEGER,
+            shares_30d INTEGER,
+            PRIMARY KEY (user_id, run_date)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cumulative_metrics (
+            user_id VARCHAR,
+            run_date DATE,
+            is_active_today INTEGER,
+            is_active_7d INTEGER,
+            is_active_30d INTEGER,
+            likes_7d INTEGER,
+            comments_7d INTEGER,
+            shares_7d INTEGER,
+            likes_30d INTEGER,
+            comments_30d INTEGER,
+            shares_30d INTEGER,
+            PRIMARY KEY (user_id, run_date)
+        )
+    """)
+
+    conn.commit()
+
+
+# ============================================================
+# RESET / CLEAN
+# ============================================================
+
+def clean_runtime() -> None:
+
+    if DB_PATH.exists():
+
+        try:
+            DB_PATH.unlink()
+
+        except PermissionError:
+
+            conn = duckdb.connect(str(DB_PATH))
+
+            for table in [
+                "cumulative_state",
+                "rescan_metrics",
+                "cumulative_metrics",
+            ]:
+                conn.execute(
+                    f"DROP TABLE IF EXISTS {table}"
+                )
+
+            conn.close()
+
+    for filename in [
+        "benchmark.csv",
+        "cumulative.csv",
+        "backfill.csv",
+    ]:
+        path = RESULTS_DIR / filename
+
+        if path.exists():
+            path.unlink()
+
+
+# ============================================================
+# RESCAN ARM
+# ============================================================
+
+def run_rescan(
+    conn: duckdb.DuckDBPyConnection,
+    target_date: date,
+    window_days: int,
+) -> tuple[float, int]:
+
+    start_time = time.perf_counter()
+
+    first_date = (
+        target_date
+        - timedelta(days=window_days - 1)
+    )
+
+    # Visit only partitions that actually exist in the requested date
+    # range. Iterating every calendar date and recursively searching for
+    # each missing partition made the 365-day benchmark unnecessarily slow.
+    partition_index = _get_partition_index()
+    files = sorted(
+        path
+        for partition_date, partition_files in partition_index.items()
+        if first_date <= partition_date <= target_date
+        for path in partition_files
+    )
+
+    if not files:
+        raise FileNotFoundError(
+            f"No Parquet files available for "
+            f"rescan ending {target_date}"
+        )
+
+    rel = parquet_relation(files)
+
+    conn.execute("""
+        DROP TABLE IF EXISTS _rescan_stage
+    """)
+
+    target_sql = sql_string(
+        sql_date(target_date)
+    )
+
+    seven_day_start_sql = sql_string(
+        sql_date(
+            target_date
+            - timedelta(days=6)
+        )
+    )
+
+    # Fixed 30-day metric boundary, independent of the benchmark
+    # window (30, 90, 365, etc.).
+    thirty_day_start_sql = sql_string(
+        sql_date(
+            target_date
+            - timedelta(days=29)
+        )
+    )
+
+    first_date_sql = sql_string(
+        sql_date(first_date)
+    )
+
+    conn.execute(f"""
+        CREATE TEMP TABLE _rescan_stage AS
+
+        SELECT
+            CAST(user_id AS VARCHAR) AS user_id,
+
+            MAX(
+                CASE
+                    WHEN CAST(event_ts AS DATE)
+                         = {target_sql}
+                    THEN 1
+                    ELSE 0
+                END
+            )::INTEGER AS is_active_today,
+
+            MAX(
+                CASE
+                    WHEN CAST(event_ts AS DATE)
+                         >= {seven_day_start_sql}
+                    THEN 1
+                    ELSE 0
+                END
+            )::INTEGER AS is_active_7d,
+
+            MAX(
+                CASE
+                    WHEN CAST(event_ts AS DATE)
+                         >= {thirty_day_start_sql}
+                    THEN 1
+                    ELSE 0
+                END
+            )::INTEGER AS is_active_30d,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'like'
+                         AND CAST(event_ts AS DATE)
+                             >= {seven_day_start_sql}
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS likes_7d,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'comment'
+                         AND CAST(event_ts AS DATE)
+                             >= {seven_day_start_sql}
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS comments_7d,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'share'
+                         AND CAST(event_ts AS DATE)
+                             >= {seven_day_start_sql}
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS shares_7d,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'like'
+                         AND CAST(event_ts AS DATE)
+                             >= {thirty_day_start_sql}
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS likes_30d,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'comment'
+                         AND CAST(event_ts AS DATE)
+                             >= {thirty_day_start_sql}
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS comments_30d,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'share'
+                         AND CAST(event_ts AS DATE)
+                             >= {thirty_day_start_sql}
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS shares_30d
+
+        FROM {rel}
+
+        WHERE CAST(event_ts AS DATE)
+              BETWEEN {first_date_sql}
+                  AND {target_sql}
+
+        GROUP BY CAST(user_id AS VARCHAR)
+    """)
+
+    conn.execute(
+        """
+        DELETE FROM rescan_metrics
+        WHERE run_date = ?
+        """,
+        [target_date],
+    )
+
+    conn.execute(f"""
+        INSERT INTO rescan_metrics
+        SELECT
+            user_id,
+            {target_sql}::DATE AS run_date,
+            is_active_today,
+            is_active_7d,
+            is_active_30d,
+            likes_7d,
+            comments_7d,
+            shares_7d,
+            likes_30d,
+            comments_30d,
+            shares_30d
+        FROM _rescan_stage
+    """)
+
+    conn.commit()
+
+    elapsed_ms = (
+        time.perf_counter() - start_time
+    ) * 1000
+
+    return elapsed_ms, len(files)
+
+
+# ============================================================
+# CUMULATIVE ARM
+# ============================================================
+
+def run_cumulative(
+    conn: duckdb.DuckDBPyConnection,
+    target_date: date,
+    window_days: int,
+) -> tuple[float, int]:
+
+    start_time = time.perf_counter()
+
+    today_files = require_partition(target_date)
+
+    today_files = sorted(set(today_files))
+
+    rel = parquet_relation(today_files)
+
+    yesterday = (
+        target_date - timedelta(days=1)
+    )
+
+    target_sql = sql_string(
+        sql_date(target_date)
+    )
+
+    yesterday_sql = sql_string(
+        sql_date(yesterday)
+    )
+
+    # --------------------------------------------------------
+    # TODAY'S STAGE
+    #
+    # One row per user.
+    #
+    # All four daily values are explicitly calculated:
+    #
+    #   active_today
+    #   likes_today
+    #   comments_today
+    #   shares_today
+    #
+    # This stage is the only source of today's values for
+    # the cumulative state.
+    # --------------------------------------------------------
+
+    conn.execute("""
+        DROP TABLE IF EXISTS _today_stage
+    """)
+
+    conn.execute(f"""
+        CREATE TEMP TABLE _today_stage AS
+
+        SELECT
+            CAST(user_id AS VARCHAR) AS user_id,
+
+            1::INTEGER AS active_today,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'like'
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS likes_today,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'comment'
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS comments_today,
+
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN event_type = 'share'
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            )::INTEGER AS shares_today
+
+        FROM {rel}
+
+        WHERE CAST(event_ts AS DATE)
+              = {target_sql}
+
+        GROUP BY CAST(user_id AS VARCHAR)
+    """)
+
+    # --------------------------------------------------------
+    # PREVIOUS DAY STATE
+    #
+    # Defensive normalization:
+    #
+    # Even if an old database was created with duplicate rows,
+    # only one previous state row per user is allowed into the
+    # candidate relation.
+    # --------------------------------------------------------
+
+    conn.execute("""
+        DROP TABLE IF EXISTS _yesterday_state
+    """)
+
+    conn.execute(f"""
+        CREATE TEMP TABLE _yesterday_state AS
+
+        SELECT
+            user_id,
+            activity_array,
+            like_array,
+            comment_array,
+            share_array
+
+        FROM (
+            SELECT
+                user_id,
+                activity_array,
+                like_array,
+                comment_array,
+                share_array,
+
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id
+                    ORDER BY run_date DESC
+                ) AS rn
+
+            FROM cumulative_state
+
+            WHERE run_date = {yesterday_sql}
+        )
+
+        WHERE rn = 1
+    """)
+
+    # --------------------------------------------------------
+    # CANDIDATE STATE
+    #
+    # Newest day is stored at position 1.
+    #
+    # Example:
+    #
+    # yesterday:
+    #   activity = [0]
+    #   shares   = [0]
+    #
+    # today:
+    #   active_today = 1
+    #   shares_today = 1
+    #
+    # result:
+    #   activity = [1, 0]
+    #   shares   = [1, 0]
+    #
+    # This explicitly preserves today's share count.
+    # --------------------------------------------------------
+
+    conn.execute("""
+        DROP TABLE IF EXISTS _candidate_state
+    """)
+
+    conn.execute(f"""
+        CREATE TEMP TABLE _candidate_state AS
+
+        SELECT
+            COALESCE(
+                t.user_id,
+                y.user_id
+            ) AS user_id,
+
+            {target_sql}::DATE AS run_date,
+
+            list_slice(
+                list_concat(
+                    list_value(
+                        COALESCE(
+                            t.active_today,
+                            0
+                        )::INTEGER
+                    ),
+                    COALESCE(
+                        y.activity_array,
+                        []::INTEGER[]
+                    )
+                ),
+                1,
+                {window_days}
+            )::INTEGER[] AS activity_array,
+
+            list_slice(
+                list_concat(
+                    list_value(
+                        COALESCE(
+                            t.likes_today,
+                            0
+                        )::INTEGER
+                    ),
+                    COALESCE(
+                        y.like_array,
+                        []::INTEGER[]
+                    )
+                ),
+                1,
+                {window_days}
+            )::INTEGER[] AS like_array,
+
+            list_slice(
+                list_concat(
+                    list_value(
+                        COALESCE(
+                            t.comments_today,
+                            0
+                        )::INTEGER
+                    ),
+                    COALESCE(
+                        y.comment_array,
+                        []::INTEGER[]
+                    )
+                ),
+                1,
+                {window_days}
+            )::INTEGER[] AS comment_array,
+
+            list_slice(
+                list_concat(
+                    list_value(
+                        COALESCE(
+                            t.shares_today,
+                            0
+                        )::INTEGER
+                    ),
+                    COALESCE(
+                        y.share_array,
+                        []::INTEGER[]
+                    )
+                ),
+                1,
+                {window_days}
+            )::INTEGER[] AS share_array
+
+        FROM _today_stage t
+
+        FULL OUTER JOIN _yesterday_state y
+            ON t.user_id = y.user_id
+    """)
+
+    # --------------------------------------------------------
+    # REPLACE TODAY'S STATE
+    # --------------------------------------------------------
+
+    conn.execute(
+        """
+        DELETE FROM cumulative_state
+        WHERE run_date = ?
+        """,
+        [target_date],
+    )
+
+    conn.execute("""
+        INSERT INTO cumulative_state (
+            user_id,
+            run_date,
+            activity_array,
+            like_array,
+            comment_array,
+            share_array
+        )
+        SELECT
+            user_id,
+            run_date,
+            activity_array,
+            like_array,
+            comment_array,
+            share_array
+        FROM _candidate_state
+        WHERE COALESCE(list_sum(activity_array), 0) > 0
+    """)
+
+    # --------------------------------------------------------
+    # SAFETY CHECK
+    #
+    # The PRIMARY KEY should guarantee uniqueness.
+    # This explicit check makes the invariant visible and
+    # catches any unexpected duplicate-generation bug.
+    # --------------------------------------------------------
+
+    duplicate_count = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT
+                user_id,
+                run_date
+            FROM cumulative_state
+            WHERE run_date = ?
+            GROUP BY user_id, run_date
+            HAVING COUNT(*) > 1
+        )
+        """,
+        [target_date],
+    ).fetchone()[0]
+
+    if duplicate_count != 0:
+        raise RuntimeError(
+            f"Duplicate cumulative state rows detected "
+            f"for {target_date}: {duplicate_count}"
+        )
+
+    # --------------------------------------------------------
+    # EXTRACT CUMULATIVE METRICS
+    # --------------------------------------------------------
+
+    conn.execute("""
+        DELETE FROM cumulative_metrics
+        WHERE run_date = ?
+    """, [target_date])
+
+    conn.execute("""
+        INSERT INTO cumulative_metrics
+        SELECT
+            user_id,
+            run_date,
+
+            CASE
+                WHEN COALESCE(
+                    list_extract(
+                        activity_array,
+                        1
+                    ),
+                    0
+                ) > 0
+                THEN 1
+                ELSE 0
+            END AS is_active_today,
+
+            CASE
+                WHEN COALESCE(
+                    list_sum(
+                        list_slice(
+                            activity_array,
+                            1,
+                            7
+                        )
+                    ),
+                    0
+                ) > 0
+                THEN 1
+                ELSE 0
+            END AS is_active_7d,
+
+            CASE
+                WHEN COALESCE(
+                    list_sum(
+                        list_slice(
+                            activity_array,
+                            1,
+                            30
+                        )
+                    ),
+                    0
+                ) > 0
+                THEN 1
+                ELSE 0
+            END AS is_active_30d,
+
+            COALESCE(
+                list_sum(
+                    list_slice(
+                        like_array,
+                        1,
+                        7
+                    )
+                ),
+                0
+            )::INTEGER AS likes_7d,
+
+            COALESCE(
+                list_sum(
+                    list_slice(
+                        comment_array,
+                        1,
+                        7
+                    )
+                ),
+                0
+            )::INTEGER AS comments_7d,
+
+            COALESCE(
+                list_sum(
+                    list_slice(
+                        share_array,
+                        1,
+                        7
+                    )
+                ),
+                0
+            )::INTEGER AS shares_7d,
+
+            COALESCE(
+                list_sum(
+                    list_slice(
+                        like_array,
+                        1,
+                        30
+                    )
+                ),
+                0
+            )::INTEGER AS likes_30d,
+
+            COALESCE(
+                list_sum(
+                    list_slice(
+                        comment_array,
+                        1,
+                        30
+                    )
+                ),
+                0
+            )::INTEGER AS comments_30d,
+
+            COALESCE(
+                list_sum(
+                    list_slice(
+                        share_array,
+                        1,
+                        30
+                    )
+                ),
+                0
+            )::INTEGER AS shares_30d
+
+        FROM cumulative_state
+
+        WHERE run_date = ?
+    """, [target_date])
+
+    conn.commit()
+
+    elapsed_ms = (
+        time.perf_counter() - start_time
+    ) * 1000
+
+    return elapsed_ms, len(today_files)
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_day(
+    conn: duckdb.DuckDBPyConnection,
+    target_date: date,
+) -> int:
+
+    result = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT
+                COALESCE(
+                    r.user_id,
+                    c.user_id
+                ) AS user_id,
+
+                r.is_active_today
+                    AS r_is_active_today,
+                c.is_active_today
+                    AS c_is_active_today,
+
+                r.is_active_7d
+                    AS r_is_active_7d,
+                c.is_active_7d
+                    AS c_is_active_7d,
+
+                r.is_active_30d
+                    AS r_is_active_30d,
+                c.is_active_30d
+                    AS c_is_active_30d,
+
+                r.likes_7d
+                    AS r_likes_7d,
+                c.likes_7d
+                    AS c_likes_7d,
+
+                r.comments_7d
+                    AS r_comments_7d,
+                c.comments_7d
+                    AS c_comments_7d,
+
+                r.shares_7d
+                    AS r_shares_7d,
+                c.shares_7d
+                    AS c_shares_7d,
+
+                r.likes_30d
+                    AS r_likes_30d,
+                c.likes_30d
+                    AS c_likes_30d,
+
+                r.comments_30d
+                    AS r_comments_30d,
+                c.comments_30d
+                    AS c_comments_30d,
+
+                r.shares_30d
+                    AS r_shares_30d,
+                c.shares_30d
+                    AS c_shares_30d
+
+            FROM rescan_metrics r
+
+            FULL OUTER JOIN cumulative_metrics c
+                ON r.user_id = c.user_id
+               AND r.run_date = c.run_date
+
+            WHERE COALESCE(
+                r.run_date,
+                c.run_date
+            ) = ?::DATE
+        )
+
+        WHERE
+            r_is_active_today
+                IS DISTINCT FROM c_is_active_today
+
+            OR r_is_active_7d
+                IS DISTINCT FROM c_is_active_7d
+
+            OR r_is_active_30d
+                IS DISTINCT FROM c_is_active_30d
+
+            OR r_likes_7d
+                IS DISTINCT FROM c_likes_7d
+
+            OR r_comments_7d
+                IS DISTINCT FROM c_comments_7d
+
+            OR r_shares_7d
+                IS DISTINCT FROM c_shares_7d
+
+            OR r_likes_30d
+                IS DISTINCT FROM c_likes_30d
+
+            OR r_comments_30d
+                IS DISTINCT FROM c_comments_30d
+
+            OR r_shares_30d
+                IS DISTINCT FROM c_shares_30d
+        """,
+        [target_date],
+    ).fetchone()
+
+    mismatches = int(result[0])
+
+    if mismatches == 0:
+        return 0
+
+    rows = conn.execute(
+        """
+        SELECT
+            COALESCE(
+                r.user_id,
+                c.user_id
+            ) AS user_id,
+
+            r.is_active_today,
+            c.is_active_today,
+
+            r.is_active_7d,
+            c.is_active_7d,
+
+            r.is_active_30d,
+            c.is_active_30d,
+
+            r.likes_7d,
+            c.likes_7d,
+
+            r.comments_7d,
+            c.comments_7d,
+
+            r.shares_7d,
+            c.shares_7d,
+
+            r.likes_30d,
+            c.likes_30d,
+
+            r.comments_30d,
+            c.comments_30d,
+
+            r.shares_30d,
+            c.shares_30d
+
+        FROM rescan_metrics r
+
+        FULL OUTER JOIN cumulative_metrics c
+            ON r.user_id = c.user_id
+           AND r.run_date = c.run_date
+
+        WHERE COALESCE(
+            r.run_date,
+            c.run_date
+        ) = ?::DATE
+
+        AND (
+            r.is_active_today
+                IS DISTINCT FROM c.is_active_today
+
+            OR r.is_active_7d
+                IS DISTINCT FROM c.is_active_7d
+
+            OR r.is_active_30d
+                IS DISTINCT FROM c.is_active_30d
+
+            OR r.likes_7d
+                IS DISTINCT FROM c.likes_7d
+
+            OR r.comments_7d
+                IS DISTINCT FROM c.comments_7d
+
+            OR r.shares_7d
+                IS DISTINCT FROM c.shares_7d
+
+            OR r.likes_30d
+                IS DISTINCT FROM c.likes_30d
+
+            OR r.comments_30d
+                IS DISTINCT FROM c.comments_30d
+
+            OR r.shares_30d
+                IS DISTINCT FROM c.shares_30d
+        )
+
+        ORDER BY 1
+
+        LIMIT 10
+        """,
+        [target_date],
+    ).fetchall()
+
+    print()
+    print(
+        f"VALIDATION FAILED: {mismatches} mismatches"
+    )
+    print()
+    print("First mismatches:")
+
+    for row in rows:
+        print(row)
+
+    print()
+    print(
+        "Cumulative state for mismatching users:"
+    )
+
+    for row in rows:
+
+        user_id = row[0]
+
+        debug = conn.execute(
+            """
+            SELECT
+                user_id,
+                run_date,
+                activity_array,
+                like_array,
+                comment_array,
+                share_array
+            FROM cumulative_state
+            WHERE user_id = ?
+              AND run_date = ?
+            """,
+            [user_id, target_date],
+        ).fetchall()
+
+        for state_row in debug:
+            print(state_row)
+
+    return mismatches
+
+
+# ============================================================
+# RUN ONE DAY
+# ============================================================
+
+def run_window_day(
+    conn: duckdb.DuckDBPyConnection,
+    target_date: date,
+    window_days: int,
+    day_number: int,
+    total_days: int,
+    output_rows: list[dict],
+) -> None:
+
+    print(
+        f"Window={window_days} "
+        f"Day={day_number}/{total_days} "
+        f"Date={target_date}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # RESCAN
+    # --------------------------------------------------------
+
+    rescan_ms, _ = run_rescan(
+        conn=conn,
+        target_date=target_date,
+        window_days=window_days,
+    )
+
+    # --------------------------------------------------------
+    # CUMULATIVE
+    # --------------------------------------------------------
+
+    cumulative_ms, _ = run_cumulative(
+        conn=conn,
+        target_date=target_date,
+        window_days=window_days,
+    )
+
+    # --------------------------------------------------------
+    # VALIDATE
+    # --------------------------------------------------------
+
+    mismatches = validate_day(
+        conn=conn,
+        target_date=target_date,
+    )
+
+    state_rows = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM cumulative_state
+        WHERE run_date = ?
+        """,
+        [target_date],
+    ).fetchone()[0]
+
+    if mismatches != 0:
+        raise RuntimeError(
+            f"Equality validation failed for "
+            f"{target_date}"
+        )
+
+    print(
+        f"VALIDATION PASS: {target_date} "
+        f"(cumulative_state_rows={state_rows})",
+        flush=True,
+    )
+
+    output_rows.append({
+        "arm": "rescan",
+        "window_days": window_days,
+        "run_date": target_date.isoformat(),
+        "wall_ms": round(rescan_ms, 3),
+        "bytes_read": 0,
+        "peak_mem_mb": 0,
+        "mismatches": 0,
+    })
+
+    output_rows.append({
+        "arm": "cumulative",
+        "window_days": window_days,
+        "run_date": target_date.isoformat(),
+        "wall_ms": round(cumulative_ms, 3),
+        "bytes_read": 0,
+        "peak_mem_mb": 0,
+        "mismatches": 0,
+    })
+
+
+# ============================================================
+# RUN WINDOW
+# ============================================================
+
+def run_window(
+    conn: duckdb.DuckDBPyConnection,
+    start_date: date,
+    days: int,
+    window_days: int,
+    output_rows: list[dict],
+) -> None:
+
+    print()
+    print("=" * 70)
+    print(
+        f"RUNNING WINDOW = {window_days} DAYS"
+    )
+    print("=" * 70)
+
+    for offset in range(days):
+
+        target_date = (
+            start_date
+            + timedelta(days=offset)
+        )
+
+        run_window_day(
+            conn=conn,
+            target_date=target_date,
+            window_days=window_days,
+            day_number=offset + 1,
+            total_days=days,
+            output_rows=output_rows,
+        )
+
+
+# ============================================================
+# WRITE RESULTS
+# ============================================================
+
+def write_results(
+    rows: list[dict],
+    filename: str,
+) -> None:
+
+    output = RESULTS_DIR / filename
+
+    fieldnames = [
+        "arm",
+        "window_days",
+        "run_date",
+        "wall_ms",
+        "bytes_read",
+        "peak_mem_mb",
+        "mismatches",
+    ]
+
+    with output.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ============================================================
+# DATE RANGE RESOLUTION
+# ============================================================
+
+def resolve_days(
+    start_date: date,
+    requested_days: int,
+) -> int:
+
+    available = available_dates()
+
+    if not available:
+        raise RuntimeError(
+            f"No Parquet data found under {DATA_DIR}"
+        )
+
+    last_available = max(available)
+
+    requested_end = (
+        start_date
+        + timedelta(days=requested_days - 1)
+    )
+
+    if requested_end <= last_available:
+        return requested_days
+
+    actual_days = (
+        last_available - start_date
+    ).days + 1
+
+    if actual_days <= 0:
+        raise ValueError(
+            f"Start date {start_date} is after "
+            f"available data ending {last_available}."
+        )
+
+    print()
+    print(
+        f"Requested {requested_days} days, "
+        f"but data is available only through "
+        f"{last_available}."
+    )
+
+    print(
+        f"Running {actual_days} available day(s) instead."
+    )
+
+    return actual_days
+
+
+# ============================================================
+# RUN PIPELINE
+# ============================================================
+
+def run_pipeline(
+    days: int,
+    windows: list[int],
+    start_date: date,
+) -> None:
+
+    ensure_directories()
+
+    days = resolve_days(
+        start_date=start_date,
+        requested_days=days,
+    )
+
+    all_rows: list[dict] = []
+
+    conn = get_connection()
+
+    try:
+
+        initialize_database(conn)
+
+        for window_days in windows:
+
+            # Completely isolate each benchmark window.
+            conn.execute(
+                "DELETE FROM cumulative_state"
+            )
+
+            conn.execute(
+                "DELETE FROM rescan_metrics"
+            )
+
+            conn.execute(
+                "DELETE FROM cumulative_metrics"
+            )
+
+            conn.commit()
+
+            run_window(
+                conn=conn,
+                start_date=start_date,
+                days=days,
+                window_days=window_days,
+                output_rows=all_rows,
+            )
+
+    finally:
+        conn.close()
+
+    write_results(
+        all_rows,
+        "cumulative.csv",
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        "PIPELINE COMPLETED SUCCESSFULLY"
+    )
+    print("=" * 70)
+    print()
+    print("Results written to:")
+    print(
+        f"  {RESULTS_DIR / 'cumulative.csv'}"
+    )
+
+
+# ============================================================
+# BENCHMARK
+# ============================================================
+
+def benchmark(
+    days: int,
+    windows: list[int],
+    start_date: date,
+) -> None:
+
+    ensure_directories()
+
+    days = resolve_days(
+        start_date=start_date,
+        requested_days=days,
+    )
+
+    rows: list[dict] = []
+
+    conn = get_connection()
+
+    try:
+
+        initialize_database(conn)
+
+        for window_days in windows:
+
+            # Every window gets an independent cumulative
+            # state so that one window cannot contaminate another.
+
+            conn.execute(
+                "DELETE FROM cumulative_state"
+            )
+
+            conn.execute(
+                "DELETE FROM rescan_metrics"
+            )
+
+            conn.execute(
+                "DELETE FROM cumulative_metrics"
+            )
+
+            conn.commit()
+
+            run_window(
+                conn=conn,
+                start_date=start_date,
+                days=days,
+                window_days=window_days,
+                output_rows=rows,
+            )
+
+    finally:
+        conn.close()
+
+    write_results(
+        rows,
+        "benchmark.csv",
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        "BENCHMARK COMPLETED SUCCESSFULLY"
+    )
+    print("=" * 70)
+    print()
+    print("Results written to:")
+    print(
+        f"  {RESULTS_DIR / 'benchmark.csv'}"
+    )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_windows(
+    value: str,
+) -> list[int]:
+
+    result: list[int] = []
+
+    for item in value.split(","):
+
+        item = item.strip()
+
+        if not item:
+            continue
+
+        number = int(item)
+
+        if number <= 0:
+            raise ValueError(
+                "Window values must be positive integers."
+            )
+
+        result.append(number)
+
+    if not result:
+        raise ValueError(
+            "At least one window must be supplied."
+        )
+
+    return result
+
+
+def main() -> None:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Benchmark Rescan vs Cumulative-table "
+            "architectures using DuckDB."
+        )
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
+
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run validation pipeline.",
+    )
+
+    run_parser.add_argument(
+        "--days",
+        type=int,
+        default=5,
+        help="Number of days to process.",
+    )
+
+    run_parser.add_argument(
+        "--windows",
+        default="30",
+        help="Comma-separated windows.",
+    )
+
+    run_parser.add_argument(
+        "--start-date",
+        default="2023-01-01",
+        help="Start date in YYYY-MM-DD format.",
+    )
+
+    # --------------------------------------------------------
+    # BENCHMARK
+    # --------------------------------------------------------
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run benchmark.",
+    )
+
+    benchmark_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Number of days to benchmark.",
+    )
+
+    benchmark_parser.add_argument(
+        "--windows",
+        default="30,90,365",
+        help="Comma-separated benchmark windows.",
+    )
+
+    benchmark_parser.add_argument(
+        "--start-date",
+        default="2023-01-01",
+        help="Start date in YYYY-MM-DD format.",
+    )
+
+    # --------------------------------------------------------
+    # CLEAN
+    # --------------------------------------------------------
+
+    subparsers.add_parser(
+        "clean",
+        help="Delete runtime database and generated results.",
+    )
+
+    args = parser.parse_args()
+
+    try:
+
+        if args.command == "clean":
+
+            clean_runtime()
+
+            print(
+                "Runtime database and generated results cleaned."
+            )
+
+            return
+
+        if args.command == "run":
+
+            if args.days <= 0:
+                raise ValueError(
+                    "--days must be greater than zero."
+                )
+
+            windows = parse_windows(
+                args.windows
+            )
+
+            start_date = date.fromisoformat(
+                args.start_date
+            )
+
+            run_pipeline(
+                days=args.days,
+                windows=windows,
+                start_date=start_date,
+            )
+
+            return
+
+        if args.command == "benchmark":
+
+            if args.days <= 0:
+                raise ValueError(
+                    "--days must be greater than zero."
+                )
+
+            windows = parse_windows(
+                args.windows
+            )
+
+            start_date = date.fromisoformat(
+                args.start_date
+            )
+
+            benchmark(
+                days=args.days,
+                windows=windows,
+                start_date=start_date,
+            )
+
+            return
+
+    except Exception as exc:
+
+        print()
+        print(f"ERROR: {exc}")
+        print()
+
+        raise
+
+
+if __name__ == "__main__":
+    main()

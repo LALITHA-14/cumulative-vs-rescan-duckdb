@@ -1,0 +1,55 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# DuckDB database files
+*.duckdb
+*.duckdb.wal
+*.db
+*.wal
+
+# Raw data and generated data files
+data/
+*.parquet
+*.parquet.tmp
+
+# Temporary files and logs
+*.log
+*.tmp
+*.temp
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE settings
+.vscode/
+.idea/
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated benchmark artifacts that should not be committed
+__pycache__/

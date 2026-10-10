@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: cumulative-rescan-app
+
+    env_file:
+      - .env
+
+    volumes:
+      - .:/app
+
+    working_dir: /app
+
+    command: ["python", "orchestrator.py", "--help"]
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import duckdb, pandas, numpy; print('ready')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
